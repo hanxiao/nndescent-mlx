@@ -1,5 +1,8 @@
 """NNDescent approximate k-NN graph construction in pure MLX for Apple Silicon.
 
+Algorithm: iteratively refine a random k-NN graph by exploring neighbors-of-neighbors.
+The key insight: "a neighbor of my neighbor is likely my neighbor too."
+
 Reference: Dong et al. "Efficient K-Nearest Neighbor Graph Construction for Generic
 Similarity Measures" (WWW 2011).
 """
@@ -38,6 +41,9 @@ class NNDescent:
     def build(self, X) -> tuple[np.ndarray, np.ndarray]:
         """Build approximate k-NN graph.
 
+        Args:
+            X: (n, d) data matrix (numpy or mlx array)
+
         Returns:
             (indices, distances): both (n, k) numpy arrays. Euclidean distances.
         """
@@ -53,12 +59,12 @@ class NNDescent:
         sq_norms = mx.sum(X * X, axis=1)
         mx.eval(sq_norms)
 
-        # Random init
-        indices_np = np.empty((n, k), dtype=np.int32)
-        for i in range(n):
-            pool = np.random.choice(n - 1, k, replace=False)
-            pool[pool >= i] += 1
-            indices_np[i] = pool
+        # Random initialization (fully vectorized)
+        # Sample k random integers in [0, n-1) for each point, then shift to avoid self
+        indices_np = np.random.randint(0, n - 1, (n, k), dtype=np.int32)
+        # For point i, candidates >= i should be incremented (to skip i itself)
+        i_vals = np.arange(n, dtype=np.int32)[:, None]  # (n, 1)
+        indices_np = np.where(indices_np >= i_vals, indices_np + 1, indices_np)
         indices = mx.array(indices_np)
 
         # Initial distances
@@ -70,40 +76,24 @@ class NNDescent:
 
         t0 = time.time()
         for it in range(self.n_iters):
-            # Forward candidates: neighbors of neighbors
-            nn_of_nn = indices[indices.reshape(-1)].reshape(n, k, k)
-            fwd_cands = nn_of_nn.reshape(n, k * k)
+            # Neighbors-of-neighbors: for each point, gather its neighbors' neighbors
+            # indices: (n, k) -> nn_of_nn[i,j,:] = indices[indices[i,j], :]
+            nn_of_nn = indices[indices.reshape(-1)].reshape(n, k, k)  # (n, k, k)
+            # Flatten to (n, k*k) candidates
+            candidates = nn_of_nn.reshape(n, k * k)
 
-            # Reverse candidates on GPU: transpose the edge list
-            # For each edge (i -> indices[i,j]), create reverse edge (indices[i,j] -> i)
-            src_all = mx.broadcast_to(mx.arange(n)[:, None], (n, k)).reshape(-1)
-            dst_all = indices.reshape(-1)
-            # Scatter src into dst's reverse list (fixed size k)
-            # Use sort-based approach: sort by dst, slice k per point
-            sort_by_dst = mx.argsort(dst_all)
-            sorted_src = src_all[sort_by_dst]
-            sorted_dst = dst_all[sort_by_dst]
-            mx.eval(sorted_src, sorted_dst)
-
-            # Each point gets n*k/n = k reverse edges on average
-            # Reshape into (n, k) by taking k entries per destination
-            # Since sort groups by dst, slice [i*k : (i+1)*k] approximately
-            # But distribution is uneven. Use simpler approach:
-            # Pad to (n, k) using the sorted order
-            rev_cands = sorted_src.reshape(n, k)  # approximate: assumes uniform distribution
-
-            # Combine: current (k) + forward (k*k) + reverse (k) = k + k^2 + k
-            all_cands = mx.concatenate([indices, fwd_cands, rev_cands], axis=1)
+            # Merge: current neighbors + candidates
+            all_cands = mx.concatenate([indices, candidates], axis=1)  # (n, k + k*k)
             total_c = all_cands.shape[1]
 
-            # Compute distances via chunked bmm
+            # Compute distances (chunked to avoid OOM)
             all_dists = self._gather_dists(X, sq_norms, all_cands)
 
-            # Mask self
+            # Mask self-references
             self_mask = all_cands == mx.arange(n)[:, None]
             all_dists = mx.where(self_mask, 1e30, all_dists)
 
-            # Deduplicate per row
+            # Deduplicate: sort by candidate index, mark duplicates
             cand_sort = mx.argsort(all_cands, axis=1)
             sc = mx.take_along_axis(all_cands, cand_sort, axis=1)
             sd = mx.take_along_axis(all_dists, cand_sort, axis=1)
@@ -112,11 +102,14 @@ class NNDescent:
                 sc[:, 1:] == sc[:, :-1]
             ], axis=1)
             sd = mx.where(is_dup, 1e30, sd)
+            # Unsort back
             unsort = mx.argsort(cand_sort, axis=1)
             all_dists = mx.take_along_axis(sd, unsort, axis=1)
+            mx.eval(all_dists)
 
-            # Top k
+            # Select top k
             top_idx = mx.argpartition(all_dists, kth=k-1, axis=1)[:, :k]
+            # Sort the top k
             top_dists = mx.take_along_axis(all_dists, top_idx, axis=1)
             sub_sort = mx.argsort(top_dists, axis=1)
             top_idx = mx.take_along_axis(top_idx, sub_sort, axis=1)
@@ -125,6 +118,7 @@ class NNDescent:
             new_dists = mx.take_along_axis(all_dists, top_idx, axis=1)
             mx.eval(new_indices, new_dists)
 
+            # Count updates
             changed = int(mx.sum(new_indices != indices))
             update_frac = changed / (n * k)
 
@@ -147,12 +141,23 @@ class NNDescent:
         return self.neighbor_graph
 
     def _gather_dists(self, X, sq_norms, col_ids):
-        """Squared distances from point i to col_ids[i, :] via chunked bmm."""
+        """Compute squared distances from each point i to col_ids[i, :].
+
+        Chunked to limit memory usage.
+
+        Args:
+            X: (n, d)
+            sq_norms: (n,)
+            col_ids: (n, c) indices
+
+        Returns:
+            (n, c) squared distances
+        """
         n, c = col_ids.shape
         d = X.shape[1]
 
-        # Chunk to limit memory: (cs, c, d) intermediate
-        max_cs = max(1, 500_000_000 // (c * d))
+        # Chunk size: limit intermediate (cs, c, d) to ~500MB
+        max_cs = max(1, 125_000_000 // (c * d))  # 500MB / 4 bytes
         max_cs = min(max_cs, n)
 
         chunks = []
@@ -164,7 +169,7 @@ class NNDescent:
             X_tgt = X[flat].reshape(cs, c, d)
             X_src = X[s:e]
 
-            # bmm: (cs, 1, d) @ (cs, d, c) -> (cs, 1, c) -> (cs, c)
+            # Batched matmul: (cs, 1, d) @ (cs, d, c) -> (cs, 1, c) -> (cs, c)
             dots = mx.matmul(X_src[:, None, :],
                             mx.transpose(X_tgt, (0, 2, 1)))[:, 0, :]
 

@@ -19,11 +19,11 @@ Reference: [Dong et al. WWW 2011](https://www.cs.princeton.edu/cass/papers/www11
 
 ```
 N      k   iters   nndescent-mlx   pynndescent   recall
-10K    15   10     0.08s           4.7s          90%
-70K    15   13     0.35s           N/A           81%
+10K    15   11     0.11s           4.7s          92%
+70K    15   20     0.66s           N/A           90%
 ```
 
-nndescent-mlx is **60x faster** than pynndescent (CPU) on 10K points, at the cost of ~10% recall.
+nndescent-mlx is **42x faster** than pynndescent (CPU) on 10K points, at the cost of ~8% recall.
 
 ## Install
 
@@ -54,15 +54,16 @@ Parameters:
 ## How it works
 
 1. Random initialization: each point gets k random neighbors
-2. For each iteration:
-   - Gather neighbors-of-neighbors (k² candidates per point)
-   - Merge with current neighbors (k + k² total)
-   - Deduplicate: sort by index, mark duplicates, set distance to inf
-   - Compute distances via chunked batched matmul on GPU
-   - Keep top k by distance
+2. For each iteration (all on Metal GPU via MLX):
+   - Forward candidates: gather neighbors-of-neighbors (k² per point)
+   - Reverse candidates: if j is i's neighbor, i becomes j's candidate
+   - Compute squared distances via chunked batched matmul on GPU
+   - Deduplicate per row: sort by candidate index, keep smallest distance
+   - Merge current + candidates, keep top k by distance
+   - Track new/old flags: only new edges propagate information
 3. Converge when < 0.1% of edges change
 
-All distance computation runs on Metal GPU via MLX. Graph structure (indices) stays on CPU to minimize memory.
+Entire pipeline runs on Metal GPU. No numpy in the hot path (except reverse candidate scatter).
 
 Dependencies: `mlx` and `numpy` only.
 

@@ -128,31 +128,20 @@ class NNDescent:
             self_mask = all_cands == mx.arange(n)[:, None]
             all_dists = mx.where(self_mask, 1e30, all_dists)
 
-            # Deduplicate per row: for duplicate candidate indices, keep the
-            # one with smallest distance. Sort by (candidate, distance), then
-            # mark later occurrences of same candidate as inf.
-            # Two-key sort: primary = candidate index, secondary = distance
-            # Use lexsort-like approach: sort by distance first, then stable sort by candidate
-            dist_order = mx.argsort(all_dists, axis=1)
-            all_cands_ds = mx.take_along_axis(all_cands, dist_order, axis=1)
-            all_dists_ds = mx.take_along_axis(all_dists, dist_order, axis=1)
+            # Deduplicate per row: sort by candidate index, mark consecutive dups
+            cand_sort = mx.argsort(all_cands, axis=1)
+            sorted_c = mx.take_along_axis(all_cands, cand_sort, axis=1)
+            sorted_d = mx.take_along_axis(all_dists, cand_sort, axis=1)
 
-            cand_sort = mx.argsort(all_cands_ds, axis=1)
-            sorted_c = mx.take_along_axis(all_cands_ds, cand_sort, axis=1)
-            sorted_d = mx.take_along_axis(all_dists_ds, cand_sort, axis=1)
-
-            # Now for each run of same candidate, the first has smallest distance
             is_dup = mx.concatenate([
                 mx.zeros((n, 1), dtype=mx.bool_),
                 sorted_c[:, 1:] == sorted_c[:, :-1]
             ], axis=1)
             sorted_d = mx.where(is_dup, 1e30, sorted_d)
 
-            # Unsort back to original order
-            unsort2 = mx.argsort(cand_sort, axis=1)
-            all_dists_ds = mx.take_along_axis(sorted_d, unsort2, axis=1)
-            unsort1 = mx.argsort(dist_order, axis=1)
-            all_dists = mx.take_along_axis(all_dists_ds, unsort1, axis=1)
+            # Unsort back
+            unsort = mx.argsort(cand_sort, axis=1)
+            all_dists = mx.take_along_axis(sorted_d, unsort, axis=1)
 
             # Select top k
             top_idx = mx.argpartition(all_dists, kth=k - 1, axis=1)[:, :k]

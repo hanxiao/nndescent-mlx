@@ -75,9 +75,10 @@ class NNDescent:
             # Reverse: each (indices[i,j], i) is also a candidate
 
             # For each point, gather neighbors-of-neighbors as candidates
-            # This is equivalent to local join but GPU-friendly:
-            # candidates[i] = union(indices[indices[i,j], :]) for all j
-            nn_of_nn = indices[indices.reshape(-1)].reshape(n, k, k)  # (n, k, k)
+            # Cap the number of neighbors used to limit memory: O(n * mc * mc)
+            mc_nn = min(k, mc)
+            nn_sub = indices[:, :mc_nn]  # (n, mc_nn)
+            nn_of_nn = indices[nn_sub.reshape(-1)].reshape(n, mc_nn, k)  # (n, mc_nn, k)
 
             # Reverse candidates: for edge (i -> j), i is a candidate for j
             # Pure MLX: sort edges by dst, compute within-group position, scatter
@@ -109,15 +110,15 @@ class NNDescent:
             rev_cands = mx.zeros((n * k,), dtype=mx.int32).at[flat_idx].add(rev_src_kept).reshape(n, k)
 
             # Also gather reverse-of-reverse (2-hop reverse):
-            # neighbors of my reverse candidates
-            rev_nn = indices[rev_cands.reshape(-1)].reshape(n, k, k)
+            rev_sub = rev_cands[:, :mc_nn]  # (n, mc_nn)
+            rev_nn = indices[rev_sub.reshape(-1)].reshape(n, mc_nn, k)  # (n, mc_nn, k)
 
-            # Combine: current(k) + nn-of-nn(k^2) + reverse(k) + rev_nn(k^2)
+            # Combine: current(k) + nn-of-nn(mc_nn*k) + reverse(k) + rev_nn(mc_nn*k)
             all_cands = mx.concatenate([
-                indices,                    # (n, k) current
-                nn_of_nn.reshape(n, k * k),  # (n, k^2) forward
-                rev_cands,                   # (n, k) reverse
-                rev_nn.reshape(n, k * k),    # (n, k^2) 2-hop reverse
+                indices,                        # (n, k)
+                nn_of_nn.reshape(n, mc_nn * k),  # (n, mc_nn*k)
+                rev_cands,                       # (n, k)
+                rev_nn.reshape(n, mc_nn * k),    # (n, mc_nn*k)
             ], axis=1)
             total_c = all_cands.shape[1]
 

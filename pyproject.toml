@@ -1,0 +1,14 @@
+[project]
+name = "nndescent-mlx"
+version = "0.1.0"
+description = "NNDescent approximate k-NN graph construction in pure MLX for Apple Silicon"
+requires-python = ">=3.10"
+dependencies = ["mlx>=0.22.0", "numpy>=1.24.0"]
+license = {text = "MIT"}
+
+[project.optional-dependencies]
+dev = ["scikit-learn", "matplotlib", "pynndescent"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"

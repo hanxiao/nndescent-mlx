@@ -18,12 +18,12 @@ Reference: [Dong et al. WWW 2011](https://www.cs.princeton.edu/cass/papers/www11
 ## Performance (M3 Ultra, Fashion-MNIST PCA-50)
 
 ```
-N      k   iters   nndescent-mlx   pynndescent   recall
-10K    15   11     0.11s           4.7s          92%
-70K    15   20     0.66s           N/A           90%
+N      k   nndescent-mlx   pynndescent   recall
+10K    15   0.11s           4.7s          93%
+70K    15   0.65s           N/A           91%
 ```
 
-nndescent-mlx is **42x faster** than pynndescent (CPU) on 10K points, at the cost of ~8% recall.
+**42x faster** than pynndescent on 10K points. Entire hot path runs on Metal GPU via MLX.
 
 ## Install
 
@@ -63,7 +63,7 @@ Parameters:
    - Track new/old flags: only new edges propagate information
 3. Converge when < 0.1% of edges change
 
-Entire pipeline runs on Metal GPU. No numpy in the hot path (except reverse candidate scatter).
+Entire pipeline runs on Metal GPU via MLX. Reverse candidate scatter uses `mx.cummax` + `at[].add()`.
 
 Dependencies: `mlx` and `numpy` only.
 

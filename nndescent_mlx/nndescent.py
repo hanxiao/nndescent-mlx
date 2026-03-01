@@ -50,11 +50,11 @@ class NNDescent:
         # Precompute squared norms
         sq_norms = mx.sum(X * X, axis=1)  # (n,)
 
-        # Random init (numpy for random, then convert)
+        # Random init
         idx_np = np.random.randint(0, n - 1, (n, k), dtype=np.int32)
         i_vals = np.arange(n, dtype=np.int32)[:, None]
         idx_np = np.where(idx_np >= i_vals, idx_np + 1, idx_np).astype(np.int32)
-        indices = mx.array(idx_np)  # (n, k)
+        indices = mx.array(idx_np)
 
         # Initial distances
         dists = _gather_dists(X, sq_norms, indices)  # (n, k)
@@ -79,44 +79,46 @@ class NNDescent:
             # candidates[i] = union(indices[indices[i,j], :]) for all j
             nn_of_nn = indices[indices.reshape(-1)].reshape(n, k, k)  # (n, k, k)
 
-            # Reverse candidates: for each edge (i -> j), add i as candidate for j
-            # Build (n, k) reverse candidate array via scatter
-            src_all = mx.broadcast_to(mx.arange(n)[:, None], (n, k)).reshape(-1)  # (n*k,)
-            dst_all = indices.reshape(-1)  # (n*k,)
+            # Reverse candidates: for edge (i -> j), i is a candidate for j
+            # Pure MLX: sort edges by dst, compute within-group position, scatter
+            src_all = mx.broadcast_to(mx.arange(n)[:, None], (n, k)).reshape(-1)
+            dst_all = indices.reshape(-1)
 
-            # Sort by destination to group reverse edges
             rev_order = mx.argsort(dst_all)
             rev_src = src_all[rev_order]
             rev_dst = dst_all[rev_order]
-            mx.eval(rev_src, rev_dst)
 
-            # Count edges per destination point
-            # Use searchsorted on sorted dst to find boundaries
-            # Build (n, k) reverse candidate array without Python loop
-            # rev_src is sorted by rev_dst. For each destination point,
-            # take the first k sources.
-            # Assign a within-group index to each edge
-            mx.eval(rev_dst)
-            rev_dst_np = np.array(rev_dst)
-            # Compute within-group position
-            group_starts = np.searchsorted(rev_dst_np, np.arange(n))
-            positions = np.arange(len(rev_dst_np)) - group_starts[rev_dst_np]
-            # Keep only first k per group
-            keep_mask = positions < k
-            kept_dst = rev_dst_np[keep_mask]
-            kept_src = np.array(rev_src)[keep_mask]
-            kept_pos = positions[keep_mask]
-            # Scatter into (n, k) array
-            rev_cands_np = np.zeros((n, k), dtype=np.int32)
-            rev_cands_np[kept_dst, kept_pos] = kept_src
-            rev_cands = mx.array(rev_cands_np)
+            # Within-group position via cumsum trick
+            is_new_group = mx.concatenate([
+                mx.ones((1,), dtype=mx.int32),
+                (rev_dst[1:] != rev_dst[:-1]).astype(mx.int32)
+            ])
+            # Running count within each group
+            global_pos = mx.arange(n * k)
+            group_start_markers = mx.where(is_new_group.astype(mx.bool_), global_pos, 0)
+            # Forward-fill group starts using cummax
+            group_starts = mx.cummax(group_start_markers)
+            within_pos = global_pos - group_starts
 
-            # Combine: current neighbors (k) + nn-of-nn (k*k) + reverse (k)
+            # Keep only first k per group, scatter into (n, k) array
+            keep = within_pos < k
+            flat_idx = rev_dst * k + within_pos
+            flat_idx = mx.where(keep, flat_idx, 0)
+            rev_src_kept = mx.where(keep, rev_src, 0)
+
+            rev_cands = mx.zeros((n * k,), dtype=mx.int32).at[flat_idx].add(rev_src_kept).reshape(n, k)
+
+            # Also gather reverse-of-reverse (2-hop reverse):
+            # neighbors of my reverse candidates
+            rev_nn = indices[rev_cands.reshape(-1)].reshape(n, k, k)
+
+            # Combine: current(k) + nn-of-nn(k^2) + reverse(k) + rev_nn(k^2)
             all_cands = mx.concatenate([
                 indices,                    # (n, k) current
                 nn_of_nn.reshape(n, k * k),  # (n, k^2) forward
                 rev_cands,                   # (n, k) reverse
-            ], axis=1)  # (n, k^2 + 2k)
+                rev_nn.reshape(n, k * k),    # (n, k^2) 2-hop reverse
+            ], axis=1)
             total_c = all_cands.shape[1]
 
             # Compute distances to all candidates
@@ -195,6 +197,90 @@ class NNDescent:
         mx.eval(indices, final_dists)
         self.neighbor_graph = (np.array(indices), np.array(final_dists))
         return self.neighbor_graph
+
+
+def _rp_tree_init(X, n, k, d, n_trees=8, leaf_size=None):
+    """Initialize k-NN graph using random projection trees.
+
+    Build n_trees random projection trees. Points in the same leaf are
+    candidate neighbors. Fill remaining slots with random points.
+
+    All on MLX GPU.
+    """
+    if leaf_size is None:
+        leaf_size = max(k * 2, 64)
+
+    # Store candidates per point as a set (numpy, then convert)
+    # For efficiency, collect leaf memberships and generate pairs
+    cand_indices = np.full((n, k), -1, dtype=np.int32)
+    cand_count = np.zeros(n, dtype=np.int32)
+
+    X_np = np.array(X)
+
+    for _ in range(n_trees):
+        # Build one RP tree: recursively split data
+        leaves = _build_rp_tree(X_np, np.arange(n), leaf_size, d)
+
+        # For each leaf, all points in the leaf are candidates for each other
+        for leaf in leaves:
+            if len(leaf) <= 1:
+                continue
+            for i in range(len(leaf)):
+                p = leaf[i]
+                for j in range(len(leaf)):
+                    if i == j:
+                        continue
+                    q = leaf[j]
+                    if cand_count[p] < k:
+                        cand_indices[p, cand_count[p]] = q
+                        cand_count[p] += 1
+
+    # Fill remaining slots with random points
+    for i in range(n):
+        while cand_count[i] < k:
+            r = np.random.randint(0, n - 1)
+            if r >= i:
+                r += 1
+            cand_indices[i, cand_count[i]] = r
+            cand_count[i] += 1
+
+    return mx.array(cand_indices)
+
+
+def _build_rp_tree(X, point_ids, leaf_size, d):
+    """Recursively build a random projection tree. Returns list of leaf arrays."""
+    if len(point_ids) <= leaf_size:
+        return [point_ids]
+
+    # Random hyperplane: pick two random points, split by midpoint
+    i, j = np.random.choice(len(point_ids), 2, replace=False)
+    p1, p2 = X[point_ids[i]], X[point_ids[j]]
+    normal = p2 - p1
+    norm = np.linalg.norm(normal)
+    if norm < 1e-10:
+        # Degenerate: split randomly
+        mid = len(point_ids) // 2
+        return (_build_rp_tree(X, point_ids[:mid], leaf_size, d) +
+                _build_rp_tree(X, point_ids[mid:], leaf_size, d))
+
+    normal /= norm
+    midpoint = (p1 + p2) / 2
+
+    # Project all points
+    projections = (X[point_ids] - midpoint) @ normal
+    left_mask = projections <= 0
+
+    left_ids = point_ids[left_mask]
+    right_ids = point_ids[~left_mask]
+
+    # Avoid empty splits
+    if len(left_ids) == 0 or len(right_ids) == 0:
+        mid = len(point_ids) // 2
+        return (_build_rp_tree(X, point_ids[:mid], leaf_size, d) +
+                _build_rp_tree(X, point_ids[mid:], leaf_size, d))
+
+    return (_build_rp_tree(X, left_ids, leaf_size, d) +
+            _build_rp_tree(X, right_ids, leaf_size, d))
 
 
 def _gather_dists(X, sq_norms, col_ids):
